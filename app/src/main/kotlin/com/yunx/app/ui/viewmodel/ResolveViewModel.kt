@@ -18,6 +18,7 @@
 
 package com.yunx.app.ui.viewmodel
 
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -27,6 +28,8 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.yunx.app.data.db.BookmarkDao
 import com.yunx.app.data.db.BookmarkEntity
+import com.yunx.app.data.db.ResolveHistoryDao
+import com.yunx.app.data.db.ResolveHistoryEntity
 import com.yunx.app.data.download.DownloadManager
 import com.yunx.app.data.download.DownloadPlatform
 import com.yunx.app.data.network.BaiduConstants
@@ -66,6 +69,7 @@ import com.yunx.app.data.repository.UCResolveRepository
 import com.yunx.app.data.repository.XunleiAccountRepository
 import com.yunx.app.data.repository.XunleiResolveRepository
 import com.yunx.app.ui.SnackbarController
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
@@ -73,6 +77,9 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
 private const val QUARK_GUEST_MAX_BYTES = 50L * 1024 * 1024
+
+/** 解析历史写入失败时的日志标签 */
+private const val TAG = "YunX-History"
 
 sealed interface ResolveUiState {
     data object Idle : ResolveUiState
@@ -102,6 +109,8 @@ class ResolveViewModel(
     private val pan115ResolveRepository: Pan115ResolveRepository,
     private val downloadManager: DownloadManager,
     private val bookmarkDao: BookmarkDao,
+    /** 解析历史（主页右上角「历史」入口的数据源）：解析成功时写入，见 [recordResolveHistory] */
+    private val resolveHistoryDao: ResolveHistoryDao,
     /** GitHub 解析器实例（null 表示未启用 GitHub 平台） */
     private val githubApi: GitHubApi? = null,
     /** GitHub 下载镜像前缀提供者（由上层从 SettingsRepository 注入用户配置） */
@@ -879,7 +888,8 @@ class ResolveViewModel(
                     currentDirFid = currentDefaultDirFid()
                     dirStack.clear()
                     pathNames = emptyList()
-                    loadFiles(s, currentDirFid, credential, repo)
+                    // recordHistory = true：这是「点解析」的根目录列表，拿到即计入解析历史
+                    loadFiles(s, currentDirFid, credential, repo, recordHistory = true)
                 }
                 .onFailure { e ->
                     val msg = e.message ?: "解析失败"
@@ -1002,6 +1012,8 @@ class ResolveViewModel(
                     currentGitHubRepo = repo
                     currentDirFid = "github:root"
                     loadGitHubRoot()
+                    // 仓库根加载成功才算一次有效解析（失败会置 Error 态，不会记）
+                    recordResolveHistoryIfLoaded()
                 }
                 is GitHubLinkType.Account -> {
                     currentLink = "https://github.com/${linkType.owner}"
@@ -1009,6 +1021,7 @@ class ResolveViewModel(
                     currentGitHubOwner = linkType.owner
                     currentDirFid = "github:account_root"
                     loadGitHubAccountRepos(firstPage = true)
+                    recordResolveHistoryIfLoaded()
                 }
                 is GitHubLinkType.DirectFile -> {
                     currentLink = linkType.url
@@ -1024,6 +1037,16 @@ class ResolveViewModel(
                 }
             }
         }
+    }
+
+    /**
+     * GitHub 顶层解析（仓库根 / 账号仓库列表）加载成功后记一条历史。
+     * 只认 Detail 态：加载失败会置 Error，此时不记；GitHub 没有「文件数」概念，fileCount 传 0。
+     */
+    private suspend fun recordResolveHistoryIfLoaded() {
+        if (uiState !is ResolveUiState.Detail) return
+        val s = session ?: return
+        recordResolveHistory(s, fileCount = 0)
     }
 
     /** 点击「forked from」：跳转到上游仓库根目录 */
@@ -1753,19 +1776,76 @@ class ResolveViewModel(
         }
     }
 
+    /**
+     * 拉取目录列表并刷新界面。
+     * @param recordHistory 是否把这次成功解析计入历史：仅「开始解析」的根目录列表传 true，
+     *   进入子目录 / 返回上级 / 面包屑跳转都不算一次新的解析。
+     */
     private suspend fun loadFiles(
         s: ShareSession,
         dirFid: String,
         credential: String,
-        repo: ShareResolveRepository
+        repo: ShareResolveRepository,
+        recordHistory: Boolean = false
     ) {
         repo.listFiles(s, dirFid, credential)
             .onSuccess { files ->
                 uiState = ResolveUiState.Detail(s, files)
+                // 只有真正拿到文件目录才算一次有效解析（下面的 onFailure 分支不会记）
+                if (recordHistory) recordResolveHistory(s, files.size)
             }
             .onFailure { e ->
                 uiState = ResolveUiState.Error(e.message ?: "获取文件列表失败")
             }
+    }
+
+    /**
+     * 记录一次有效的解析历史（在解析页点「开始解析」并成功拿到分享文件目录 / 仓库根之后调用）。
+     *
+     * - 同一链接重复解析不新增记录，只刷新时间与标题并置顶，同时累计解析次数；
+     * - 只保留最近 [ResolveHistoryEntity.MAX_ENTRIES] 条，超出淘汰最旧；
+     * - 数据库异常不影响解析结果本身（目录已经拿到就正常展示，只是少一条历史）。
+     *
+     * @param fileCount 根目录条目数；GitHub 没有「文件数」概念，传 0（UI 据此不展示该徽标）。
+     */
+    private suspend fun recordResolveHistory(s: ShareSession, fileCount: Int = 0) {
+        val link = currentLink?.trim().orEmpty()
+        if (link.isBlank()) return
+        try {
+            val pwd = currentPwd.orEmpty()
+            val platform = currentPlatform.name
+            val now = System.currentTimeMillis()
+            val existing = resolveHistoryDao.findByLink(link)
+            if (existing == null) {
+                resolveHistoryDao.insert(
+                    ResolveHistoryEntity(
+                        link = link,
+                        pwd = pwd,
+                        platform = platform,
+                        title = s.title,
+                        fileCount = fileCount,
+                        parseCount = 1,
+                        resolveTime = now
+                    )
+                )
+            } else {
+                resolveHistoryDao.refresh(
+                    id = existing.id,
+                    time = now,
+                    title = s.title,
+                    pwd = pwd,
+                    platform = platform,
+                    fileCount = fileCount
+                )
+            }
+            resolveHistoryDao.trimTo(ResolveHistoryEntity.MAX_ENTRIES)
+        } catch (e: CancellationException) {
+            // 协程被取消时必须继续向上抛，不能当成「写历史失败」吞掉
+            throw e
+        } catch (e: Exception) {
+            // 写历史失败不影响解析结果本身（目录已经拿到，照常展示）
+            Log.w(TAG, "写入解析历史失败", e)
+        }
     }
 
     class Factory(
@@ -1785,6 +1865,7 @@ class ResolveViewModel(
         private val pan115ResolveRepository: Pan115ResolveRepository,
         private val downloadManager: DownloadManager,
         private val bookmarkDao: BookmarkDao,
+        private val resolveHistoryDao: ResolveHistoryDao,
         private val githubApi: GitHubApi? = null,
         private val mirrorPrefixProvider: () -> String = { UpdateChecker.MIRROR_PREFIX },
         private val noSaveDownloadProvider: () -> Boolean = { true }
@@ -1802,6 +1883,7 @@ class ResolveViewModel(
                 pan115AccountRepository, pan115ResolveRepository,
                 downloadManager,
                 bookmarkDao,
+                resolveHistoryDao,
                 githubApi,
                 mirrorPrefixProvider,
                 noSaveDownloadProvider

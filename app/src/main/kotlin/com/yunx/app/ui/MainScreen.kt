@@ -40,6 +40,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Bookmarks
+import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -135,6 +136,7 @@ import com.yunx.app.ui.screens.AboutScreen
 import com.yunx.app.ui.screens.BookmarkScreen
 import com.yunx.app.ui.screens.DownloadScreen
 import com.yunx.app.ui.screens.DriveScreen
+import com.yunx.app.ui.screens.HistoryScreen
 import com.yunx.app.ui.screens.OnboardingScreen
 import com.yunx.app.ui.screens.ResolveScreen
 import com.yunx.app.ui.screens.SettingsScreen
@@ -154,6 +156,7 @@ import com.yunx.app.ui.viewmodel.Pan123AccountViewModel
 import com.yunx.app.ui.viewmodel.Pan123CloudViewModel
 import com.yunx.app.ui.viewmodel.QuarkAccountViewModel
 import com.yunx.app.ui.viewmodel.QuarkCloudViewModel
+import com.yunx.app.ui.viewmodel.ResolveHistoryViewModel
 import com.yunx.app.ui.viewmodel.ResolveViewModel
 import com.yunx.app.ui.viewmodel.UCCoudViewModel
 import com.yunx.app.ui.viewmodel.UCAccountViewModel
@@ -179,6 +182,9 @@ internal const val OVERLAY_KEY_THEME = "overlay-theme"
 
 /** 收藏页从顶栏图标进入，没有"被点的那一项"，不做共享元素形变（普通淡入即可） */
 internal const val OVERLAY_KEY_BOOKMARKS = "overlay-bookmarks"
+
+/** 解析历史页（主页右上角「历史」图标进入）：与收藏页同理，源就是顶栏那个图标 */
+internal const val OVERLAY_KEY_HISTORY = "overlay-history"
 
 /**
  * 主页框架：
@@ -209,6 +215,7 @@ fun MainScreen() {
     var showSupport by rememberSaveable { mutableStateOf(false) }
     var showTheme by rememberSaveable { mutableStateOf(false) }
     var showBookmarks by rememberSaveable { mutableStateOf(false) }
+    var showHistory by rememberSaveable { mutableStateOf(false) }
     val saveableStateHolder = rememberSaveableStateHolder()
 
     val context = LocalContext.current
@@ -550,6 +557,7 @@ fun MainScreen() {
             pan115ResolveRepository,
             downloadManager,
             db.bookmarkDao(),
+            db.resolveHistoryDao(),
             githubApi,
             // 取链方式开关：设置页「免转存下载」实时生效
             noSaveDownloadProvider = { settings.quarkNoSaveDownload }
@@ -560,6 +568,9 @@ fun MainScreen() {
     )
     val bookmarkViewModel: BookmarkViewModel = viewModel(
         factory = BookmarkViewModel.Factory(db.bookmarkDao())
+    )
+    val resolveHistoryViewModel: ResolveHistoryViewModel = viewModel(
+        factory = ResolveHistoryViewModel.Factory(db.resolveHistoryDao())
     )
     val quarkAccount by viewModel.quarkAccount.collectAsState()
     val ucAccount by ucViewModel.ucAccount.collectAsState()
@@ -709,6 +720,7 @@ fun MainScreen() {
         showSupport -> OVERLAY_KEY_SUPPORT
         showTheme -> OVERLAY_KEY_THEME
         showBookmarks -> OVERLAY_KEY_BOOKMARKS
+        showHistory -> OVERLAY_KEY_HISTORY
         else -> null
     }
     // 正在展示的叠加页路由：打开时更新，关闭时**保留**（退出动画要用它渲染那个页面）
@@ -779,8 +791,20 @@ fun MainScreen() {
                             Text(text = currentTab.title)
                         },
                         actions = {
-                            // 解析页标题右上角：收藏网盘链接入口
+                            // 解析页（主页）标题右上角：解析历史 + 收藏网盘链接两个入口
                             if (currentTab == MainTab.Resolve) {
+                                // 历史排在收藏左侧：收藏图标位置保持不变（它是容器变换的"源"，挪位会改变形变起点）
+                                IconButton(
+                                    onClick = { showHistory = true },
+                                    // ★ 历史页就是从这个图标进来的：图标本身当"源"，用同一个 key 做容器变换，
+                                    //   打开时图标长成整页、关闭时收回图标（与收藏页图标完全一致）
+                                    modifier = Modifier.sharedBounds(
+                                        rememberSharedContentState(OVERLAY_KEY_HISTORY),
+                                        animatedVisibilityScope = sourceScope
+                                    )
+                                ) {
+                                    Icon(Icons.Outlined.History, contentDescription = "解析历史")
+                                }
                                 IconButton(
                                     onClick = { showBookmarks = true },
                                     // ★ 收藏页就是从这个图标进来的：图标本身当"源"，用同一个 key 做容器变换，
@@ -1010,7 +1034,22 @@ fun MainScreen() {
                             )
                             OVERLAY_KEY_SUPPORT -> SupportScreen(onBack = { showSupport = false })
                             OVERLAY_KEY_THEME -> ThemeScreen(onBack = { showTheme = false })
-                            else -> BookmarkScreen(
+                            OVERLAY_KEY_HISTORY -> HistoryScreen(
+                                viewModel = resolveHistoryViewModel,
+                                onBack = { showHistory = false },
+                                onResolve = { link, pwd ->
+                                    showHistory = false
+                                    currentTab = MainTab.Resolve
+                                    // 历史里可能存着 GitHub 链接：与收藏页一致，走 GitHub 解析入口
+                                    val github = GitHubLinkParser.parse(link)
+                                    if (github != null) {
+                                        resolveViewModel.startGitHubResolve(github)
+                                    } else {
+                                        resolveViewModel.startResolve(link, pwd)
+                                    }
+                                }
+                            )
+                            OVERLAY_KEY_BOOKMARKS -> BookmarkScreen(
                                 viewModel = bookmarkViewModel,
                                 onBack = { showBookmarks = false },
                                 onResolve = { link, pwd ->
@@ -1025,6 +1064,7 @@ fun MainScreen() {
                                     }
                                 }
                             )
+                            else -> Unit
                         }
                     }
                 }

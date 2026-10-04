@@ -28,8 +28,8 @@ import com.yunx.app.data.security.AndroidKeystoreCredentialCipher
 import com.yunx.app.data.security.CredentialCipher
 
 @Database(
-    entities = [QuarkAccountEntity::class, DownloadTaskEntity::class, UCAccountEntity::class, XunleiAccountEntity::class, BaiduAccountEntity::class, C139AccountEntity::class, Pan123AccountEntity::class, Pan115AccountEntity::class, BookmarkEntity::class],
-    version = 16,
+    entities = [QuarkAccountEntity::class, DownloadTaskEntity::class, UCAccountEntity::class, XunleiAccountEntity::class, BaiduAccountEntity::class, C139AccountEntity::class, Pan123AccountEntity::class, Pan115AccountEntity::class, BookmarkEntity::class, ResolveHistoryEntity::class],
+    version = 17,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -51,6 +51,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun rawPan115AccountDao(): Pan115AccountDao
 
     abstract fun bookmarkDao(): BookmarkDao
+
+    abstract fun resolveHistoryDao(): ResolveHistoryDao
 
     private lateinit var credentialCipher: CredentialCipher
 
@@ -80,7 +82,8 @@ abstract class AppDatabase : RoomDatabase() {
                         MIGRATION_12_13,
                         MIGRATION_13_14,
                         MIGRATION_14_15,
-                        MIGRATION_15_16
+                        MIGRATION_15_16,
+                        MIGRATION_16_17
                     )
                     // 早期开发版（1-8）无可靠 schema；从 v9 起必须保留凭证和下载任务
                     .fallbackToDestructiveMigrationFrom(1, 2, 3, 4, 5, 6, 7, 8)
@@ -151,6 +154,24 @@ abstract class AppDatabase : RoomDatabase() {
                         "`nickname` TEXT NOT NULL, " +
                         "`updatedAt` INTEGER NOT NULL, " +
                         "PRIMARY KEY(`id`))"
+                )
+            }
+        }
+
+        private val MIGRATION_16_17 = object : Migration(16, 17) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // 解析历史（主页右上角「历史」入口）：只新增表，不动旧表。
+                // 列定义必须与 ResolveHistoryEntity 生成的 schema 完全一致（不加 DEFAULT，避免 Room 校验失配）
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `resolve_history` (" +
+                        "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "`link` TEXT NOT NULL, " +
+                        "`pwd` TEXT NOT NULL, " +
+                        "`platform` TEXT NOT NULL, " +
+                        "`title` TEXT NOT NULL, " +
+                        "`fileCount` INTEGER NOT NULL, " +
+                        "`parseCount` INTEGER NOT NULL, " +
+                        "`resolveTime` INTEGER NOT NULL)"
                 )
             }
         }
